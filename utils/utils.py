@@ -62,8 +62,10 @@ def set_log_dir(root_dir, exp_name):
 def save_checkpoint(states, is_best, output_dir,
                     filename='checkpoint.pth'):
     torch.save(states, os.path.join(output_dir, filename))
+    print("Save model to {}".format(os.path.join(output_dir, filename)))
     if is_best:
         torch.save(states, os.path.join(output_dir, 'checkpoint_best.pth'))
+        print("Save best model to {}".format(os.path.join(output_dir, 'checkpoint_best.pth')))
 
 
 class RunningStats:

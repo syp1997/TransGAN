@@ -206,17 +206,20 @@ def train(args, gen_net: nn.Module, dis_net: nn.Module, gen_optimizer, dis_optim
 
         # verbose
         if gen_step and iter_idx % args.print_freq == 0:
-            sample_imgs = gen_imgs[:25]
-            # scale_factor = args.img_size // int(sample_imgs.size(3))
-            # sample_imgs = torch.nn.functional.interpolate(sample_imgs, scale_factor=2)
-            img_grid = make_grid(sample_imgs, nrow=5, normalize=True, scale_each=True)
-            save_image(sample_imgs, f'sampled_images_{args.exp_name}.jpg', nrow=5, normalize=True, scale_each=True)
-            # writer.add_image(f'sampled_images_{args.exp_name}', img_grid, global_steps)
             tqdm.write(
                 "[Epoch %d/%d] [Batch %d/%d] [D loss: %f] [G loss: %f] alpha: %f" %
                 (epoch, args.max_epoch, iter_idx % len(train_loader), len(train_loader), d_loss.item(), g_loss.item(), gen_net.module.alpha))
 
         writer_dict['train_global_steps'] = global_steps + 1
+    
+    # save images
+    sample_imgs = gen_imgs[:25]
+    # scale_factor = args.img_size // int(sample_imgs.size(3))
+    # sample_imgs = torch.nn.functional.interpolate(sample_imgs, scale_factor=2)
+    img_grid = make_grid(sample_imgs, nrow=5, normalize=True, scale_each=True)
+    save_image_path = os.path.join(args.path_helper['sample_path'], f'sampled_images_epoch_{epoch}.jpg')
+    save_image(sample_imgs, save_image_path, nrow=5, normalize=True, scale_each=True)
+    # writer.add_image(f'sampled_images_{args.exp_name}', img_grid, global_steps)
 
 
 

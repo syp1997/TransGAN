@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
-# @Date    : 2019-10-01
-# @Author  : Xinyu Gong (xy_gong@tamu.edu)
+# @Date    : 2021-02-23
+# @Author  : Yinpei Su (syinpei@bu.edu)
 # @Link    : None
 # @Version : 0.0
 
@@ -43,6 +43,15 @@ def main():
     _init_inception()
     inception_path = check_or_download_inception(None)
     create_inception_graph(inception_path)
+    
+    # epoch number for dis_net
+    dataset = datasets.ImageDataset(args, cur_img_size=8)
+    train_loader = dataset.train
+    if args.max_iter:
+        args.max_epoch = np.ceil(args.max_iter / len(train_loader))
+    else:
+        args.max_iter = args.max_epoch * len(train_loader)
+    args.max_epoch = args.max_epoch * args.n_critic
 
     # import network
     gen_net = eval('models.'+args.gen_model+'.Generator')(args=args).cuda()
@@ -102,13 +111,6 @@ def main():
         raise NotImplementedError(f'no fid stat for {args.dataset.lower()}')
     assert os.path.exists(fid_stat)
 
-    # epoch number for dis_net
-    args.max_epoch = args.max_epoch * args.n_critic
-    dataset = datasets.ImageDataset(args, cur_img_size=8)
-    train_loader = dataset.train
-    if args.max_iter:
-        args.max_epoch = np.ceil(args.max_iter * args.n_critic / len(train_loader))
-
     # initial
     fixed_z = torch.cuda.FloatTensor(np.random.normal(0, 1, (64, args.latent_dim)))
     gen_avg_param = copy_params(gen_net)
@@ -128,24 +130,24 @@ def main():
         dis_net.load_state_dict(checkpoint['dis_state_dict'])
         gen_optimizer.load_state_dict(checkpoint['gen_optimizer'])
         dis_optimizer.load_state_dict(checkpoint['dis_optimizer'])
-        avg_gen_net = deepcopy(gen_net)
-        avg_gen_net.load_state_dict(checkpoint['avg_gen_state_dict'])
-        gen_avg_param = copy_params(avg_gen_net)
-        del avg_gen_net
+#         avg_gen_net = deepcopy(gen_net)
+#         avg_gen_net.load_state_dict(checkpoint['avg_gen_state_dict'])
+        gen_avg_param = checkpoint['gen_avg_param']
+#         del avg_gen_net
         cur_stage = cur_stages(start_epoch, args)
         gen_net.module.cur_stage = cur_stage
         dis_net.module.cur_stage = cur_stage
         gen_net.module.alpha = 1.
         dis_net.module.alpha = 1.
 
-        # args.path_helper = checkpoint['path_helper']
+        args.path_helper = checkpoint['path_helper']
         
     else:
         # create new log dir
         assert args.exp_name
-    args.path_helper = set_log_dir('logs', args.exp_name)
+        args.path_helper = set_log_dir('logs', args.exp_name)
+        
     logger = create_logger(args.path_helper['log_path'])
-
     logger.info(args)
     writer_dict = {
         'writer': SummaryWriter(args.path_helper['log_path']),
@@ -153,14 +155,36 @@ def main():
         'valid_global_steps': start_epoch // args.val_freq,
     }
 
-    # train loop
+    
+    def return_states():
+        states = {}
+        states['epoch'] = epoch
+        states['best_fid'] = best_fid_score
+        states['gen_state_dict'] = gen_net.state_dict()
+        states['dis_state_dict'] = dis_net.state_dict()
+        states['gen_optimizer'] = gen_optimizer.state_dict()
+        states['dis_optimizer'] = dis_optimizer.state_dict()
+        states['gen_avg_param'] = gen_avg_param
+        states['path_helper'] = args.path_helper
+        return states
+
         
-    epoch = 300
-    backup_param = copy_params(gen_net)
-    load_params(gen_net, gen_avg_param)
-    fid_score = validate(args, fixed_z, fid_stat, epoch, gen_net, writer_dict, )
-    logger.info(f'FID score: {fid_score} || @ epoch {epoch}.')
-    load_params(gen_net, backup_param)
+    # train loop
+    
+    for epoch in range(start_epoch+1, args.max_epoch):
+        train(args, gen_net, dis_net, gen_optimizer, dis_optimizer, gen_avg_param, train_loader, epoch, writer_dict, fixed_z, )
+        backup_param = copy_params(gen_net)
+        load_params(gen_net, gen_avg_param)
+        fid_score = validate(args, fixed_z, fid_stat, epoch, gen_net, writer_dict, )
+        logger.info(f'FID score: {fid_score} || @ epoch {epoch}.')
+        load_params(gen_net, backup_param)
+        is_best = False
+        if epoch == 1 or fid_score < best_fid_score:
+            best_fid_score = fid_score
+            is_best = True
+        if is_best or epoch % 1 == 0:
+            states = return_states()
+            save_checkpoint(states, is_best, args.path_helper['ckpt_path'], filename=f'checkpoint_epoch_{epoch}.pth')
 
 
 

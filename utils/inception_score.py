@@ -16,7 +16,7 @@ from tqdm import tqdm
 
 
 os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'
-MODEL_DIR = '/tmp/imagenet'
+MODEL_DIR = './tmp/imagenet'
 DATA_URL = 'http://download.tensorflow.org/models/image/imagenet/inception-2015-12-05.tgz'
 softmax = None
 
@@ -78,6 +78,8 @@ def _init_inception():
         print()
         statinfo = os.stat(filepath)
         print('Succesfully downloaded', filename, statinfo.st_size, 'bytes.')
+    else:
+        print("Find file {}".format(filepath))
     tarfile.open(filepath, 'r:gz').extractall(MODEL_DIR)
     with tf.gfile.FastGFile(os.path.join(
             MODEL_DIR, 'classify_image_graph_def.pb'), 'rb') as f:
