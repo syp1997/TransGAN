@@ -73,26 +73,7 @@ class Attention(nn.Module):
         x = self.proj(x)
         x = self.proj_drop(x)
         return x
-
-
-class Block(nn.Module):
-
-    def __init__(self, dim, num_heads, mlp_ratio=4., qkv_bias=False, qk_scale=None, drop=0., attn_drop=0.,
-                 drop_path=0., act_layer=gelu, norm_layer=nn.LayerNorm):
-        super().__init__()
-        self.norm1 = norm_layer(dim)
-        self.attn = Attention(
-            dim, num_heads=num_heads, qkv_bias=qkv_bias, qk_scale=qk_scale, attn_drop=attn_drop, proj_drop=drop)
-        # NOTE: drop path for stochastic depth, we shall see if this is better than dropout here
-        self.drop_path = DropPath(drop_path) if drop_path > 0. else nn.Identity()
-        self.norm2 = norm_layer(dim)
-        mlp_hidden_dim = int(dim * mlp_ratio)
-        self.mlp = Mlp(in_features=dim, hidden_features=mlp_hidden_dim, act_layer=act_layer, drop=drop)
-
-    def forward(self, x):
-        x = x + self.drop_path(self.attn(self.norm1(x)))
-        x = x + self.drop_path(self.mlp(self.norm2(x)))
-        return x
+    
 
 def pixel_upsample(x, H, W):
     B, N, C = x.size()
@@ -105,93 +86,107 @@ def pixel_upsample(x, H, W):
     x = x.permute(0,2,1)
     return x, H, W
 
-class Generator(nn.Module):
-    def __init__(self, args, img_size=224, patch_size=16, in_chans=3, num_classes=10, embed_dim=384, depth=5,
-                 num_heads=4, mlp_ratio=4., qkv_bias=False, qk_scale=None, drop_rate=0., attn_drop_rate=0.,
-                 drop_path_rate=0., hybrid_backbone=None, norm_layer=nn.LayerNorm):
-        super(Generator, self).__init__()
-        self.args = args
-        self.ch = embed_dim
-        self.bottom_width = args.bottom_width
-        self.embed_dim = embed_dim = args.gf_dim
-        self.l1 = nn.Linear(args.latent_dim, (self.bottom_width ** 2) * self.embed_dim)
-        self.pos_embed_1 = nn.Parameter(torch.zeros(1, self.bottom_width**2, embed_dim))
-        self.pos_embed_2 = nn.Parameter(torch.zeros(1, (self.bottom_width*2)**2, embed_dim//4))
-        self.pos_embed_3 = nn.Parameter(torch.zeros(1, (self.bottom_width*4)**2, embed_dim//16))
-        self.pos_embed = [
-            self.pos_embed_1,
-            self.pos_embed_2,
-            self.pos_embed_3
-        ]
-        dpr = [x.item() for x in torch.linspace(0, drop_path_rate, depth)]  # stochastic depth decay rule
-        self.blocks = nn.ModuleList([
-                Block(
-                    dim=embed_dim, num_heads=num_heads, mlp_ratio=mlp_ratio, qkv_bias=qkv_bias, qk_scale=qk_scale,
-                    drop=drop_rate, attn_drop=attn_drop_rate, drop_path=dpr[i], norm_layer=norm_layer)
-            for i in range(depth)])
-        self.upsample_blocks = nn.ModuleList([
-                nn.Sequential(
-                    Block(
-                        dim=embed_dim//4, num_heads=num_heads, mlp_ratio=mlp_ratio, qkv_bias=qkv_bias, qk_scale=qk_scale,
-                        drop=drop_rate, attn_drop=attn_drop_rate, drop_path=0, norm_layer=norm_layer),
-                    Block(
-                        dim=embed_dim//4, num_heads=num_heads, mlp_ratio=mlp_ratio, qkv_bias=qkv_bias, qk_scale=qk_scale,
-                        drop=drop_rate, attn_drop=attn_drop_rate, drop_path=0, norm_layer=norm_layer),
-                    Block(
-                        dim=embed_dim//4, num_heads=num_heads, mlp_ratio=mlp_ratio, qkv_bias=qkv_bias, qk_scale=qk_scale,
-                        drop=drop_rate, attn_drop=attn_drop_rate, drop_path=0, norm_layer=norm_layer),
-                    Block(
-                        dim=embed_dim//4, num_heads=num_heads, mlp_ratio=mlp_ratio, qkv_bias=qkv_bias, qk_scale=qk_scale,
-                        drop=drop_rate, attn_drop=attn_drop_rate, drop_path=0, norm_layer=norm_layer)
-                ),
-                nn.Sequential(
-                    
-                    Block(
-                        dim=embed_dim//16, num_heads=num_heads, mlp_ratio=mlp_ratio, qkv_bias=qkv_bias, qk_scale=qk_scale,
-                        drop=drop_rate, attn_drop=attn_drop_rate, drop_path=0, norm_layer=norm_layer),
-                    Block(
-                        dim=embed_dim//16, num_heads=num_heads, mlp_ratio=mlp_ratio, qkv_bias=qkv_bias, qk_scale=qk_scale,
-                        drop=drop_rate, attn_drop=attn_drop_rate, drop_path=0, norm_layer=norm_layer)
-                )
-                ])
-        for i in range(len(self.pos_embed)):
-            trunc_normal_(self.pos_embed[i], std=.02)
-    
-        self.to_rgb = nn.Sequential(
-            nn.BatchNorm2d(args.gf_dim),
-            nn.ReLU(),
-            # nn.Conv2d(args.gf_dim, 3, 3, 1, 1),
-            nn.Tanh()
-        )
 
-        self.deconv = nn.Sequential(
-            # nn.BatchNorm2d(self.embed_dim),
-            # nn.ReLU(),
-            nn.Conv2d(self.embed_dim//16, 3, 1, 1, 0),
-            # nn.Tanh()
-        )
+class NestedTransformerEncoderLayer(nn.Module):
+    def __init__(self,
+                 d_model=256, d_ffn=1024,
+                 dropout=0.1, activation="relu",
+                 n_levels=4, n_heads=8):
+        super().__init__()
+        self.n_heads = n_heads
+        self.d_model = d_model
+        self.dropout = dropout
+        self.head_dim = d_model // n_heads
 
-    def set_arch(self, x, cur_stage):
-        pass
+        self.attention_type = 'cross_multi_scale'
+        self.query_size = 1
+        self.n_blocks = [(8, 8), (7, 9), (8, 7), (7, 8), (8, 9), (9, 7), (9, 8), (9, 9)]
+        self.max_block = 64
+        assert len(self.n_blocks) == self.n_heads
+        
+        self.linear0 = nn.Linear(3, d_model)
+        self.key = nn.Linear(d_model, d_model)
+        self.qkv = nn.Linear(d_model, d_model * 3)
+        self.query_embed = nn.Parameter(
+            torch.randn(1, self.n_heads, self.max_block, self.query_size + 1, self.head_dim))
+        self.o_z = nn.Parameter(torch.zeros([1, self.n_heads, self.max_block, 1, self.head_dim]))
 
-    def forward(self, z, epoch=100):
-        x = self.l1(z).view(-1, self.bottom_width ** 2, self.embed_dim)
-        x = x + self.pos_embed[0].to(x.get_device())
-        B = x.size()
-        H, W = self.bottom_width, self.bottom_width
-        for index, blk in enumerate(self.blocks):
-            x = blk(x)
-        for index, blk in enumerate(self.upsample_blocks):
-            # x = x.permute(0,2,1)
-            # x = x.view(-1, self.embed_dim, H, W)
-            x, H, W = pixel_upsample(x, H, W)
-            x = x + self.pos_embed[index+1].to(x.get_device())
-            x = blk(x)
-            # _, _, H, W = x.size()
-            # x = x.view(-1, self.embed_dim, H*W)
-            # x = x.permute(0,2,1)
-        output = self.deconv(x.permute(0, 2, 1).view(-1, self.embed_dim//16, H, W))
-        return output
+        self.o_pos_q1 = nn.Parameter(torch.randn(1, self.n_heads, self.max_block, self.query_size, self.head_dim)) # b * 8 * 64 * 1 * 32
+        self.o_pos_k1 = nn.Parameter(torch.randn(1, self.n_heads, self.max_block, self.query_size, self.head_dim)) # b * 8 * 64 * 1 * 32
+        
+        self.out = nn.Linear(d_model, d_model)
+        self.dropout1 = nn.Dropout(dropout)
+        self.norm1 = nn.LayerNorm(d_model)
+
+        self.linear1 = nn.Linear(d_model, d_ffn)
+        self.activation = _get_activation_fn(activation)
+        self.dropout2 = nn.Dropout(dropout)
+        self.linear2 = nn.Linear(d_ffn, d_model)
+        self.dropout3 = nn.Dropout(dropout)
+        self.norm2 = nn.LayerNorm(d_model)
+
+    def self_attn(self, x):
+        x = self.linear0(x) # b * 32 * 32 * 256
+        k = self.key(x) # b * 32 * 32 * 256
+        qkv = self.qkv(x) # b * 32 * 32 * (256*3)
+        x = torch.cat([k, qkv])  # b * 32 * 32 * (256*4)
+        
+        bs, h, w, c = x.shape  # b * 32 * 32 * (256*4)
+        nh, nw = self.n_blocks[0]
+        x = x.view(bs, nh, h // nh, nw, w // nw, c).transpose(2, 3) # b * 8 * 4 * 8 * 4 * (256*4)
+        x = x.transpose(2, 3) # b * 8 * 8 * 4 * 4 * (256*4)
+        x = x.reshape(bs, nh * nw, -1, c) # b * 64 * 16 * (256*4)
+        x = x.view(bs, nh * nw, -1, self.n_heads, c/self.n_heads).permute(0, 3, 1, 2, 4)  # b * 8 * 64 * 16 * (32*4)
+        x = x.reshape(bs, (self.n_heads * nh * nw), -1, c/self.n_heads) # b * (8*64) * 16 * (32*4)
+        k, qkv = x.split([self.d_head, self.d_head * 3], dim=-1) # b * (8*64) * 16 * (32), b * (8*64) * 16 * (32*3)
+        
+        results = []
+        q = self.query_embed.expand(bs, self.n_heads, self.max_block, self.query_size + 1, -1)  # b * 8 * 64 * 2 * 32
+        q = q.reshape(bs, self.n_heads * self.max_block, self.query_size + 1, -1) # b * (8*64) * 2 * 32
+        E = torch.eye(self.head_dim).to(device=q.device, dtype=q.dtype)
+        
+        a_logits = torch.matmul(q, k.transpose(2, 3)) # b * (8*64) * 2 * 16
+        a_logits_row, _ = a_logits.split([self.query_size, 1], dim=2) # b * (8*64) * 1 * 16
+        a_row = F.softmax(a_logits_row, dim=-1)  # b * (8*64) * 1 * 16
+        a_col = F.softmax(a_logits.transpose(2, 3), dim=-1)  # b * (8*64) * 16 * 2
+        q1, k1, v1 = torch.matmul(a_row, qkv).view(bs, self.n_heads, self.max_block, self.query_size, -1).split(self.head_dim, dim=-1) # b * 8 * 64 * 1 * 32
+        q1 = q1 + self.o_pos_q1
+        k1 = k1 + self.o_pos_k1
+        q1 = q1.view(bs * self.n_heads, self.max_block * self.query_size, -1) # (b*8) * (64*1) * 32
+        k1 = k1.view(bs * self.n_heads, self.max_block * self.query_size, -1) # (b*8) * (64*1) * 32
+        v1 = v1.view(bs * self.n_heads, self.max_block * self.query_size, -1) # (b*8) * (64*1) * 32
+
+        o = F.multi_head_attention_forward(
+            q1.transpose(0, 1), k1.transpose(0, 1), v1.transpose(0, 1),
+            self.head_dim, 1, None, None, None, None, False,
+            self.dropout, E, None, use_separate_proj_weight=True,
+            q_proj_weight=E, k_proj_weight=E, v_proj_weight=E,
+            training=self.training)[0].transpose(0, 1) # (b*8) * (64*1) * 32
+
+        o = o.reshape(bs, self.n_heads * self.max_block, self.query_size, -1) # b * (8*64) * 1 * 32
+        o_z = self.o_z.expand(bs, self.n_heads, self.max_block, 1, -1)  # b * 8 * 64 * 1 * 32
+        o_z = o_z.reshape(bs, self.n_heads * self.max_block, 1, -1) # b * (8*64) * 1 * 32
+        o = torch.cat([o, o_z], dim=2) # b * (8*64) * 2 * 32
+        o = torch.matmul(a_col, o) # b * (8*64) * 16 * 32
+
+        res = o.reshape(bs, self.max_block, -1, self.n_heads*self.n_models) # b * 64 * 16 * 256
+        res = self.out(res)
+        return res
+
+    def forward_ffn(self, src):
+        src2 = self.linear2(self.dropout2(self.activation(self.linear1(src))))
+        src = src + self.dropout3(src2)
+        src = self.norm2(src)
+        return src
+
+    def forward(self, x):
+        # self attention
+        x = self.norm1(x + self.dropout1(self.self_attn(x)))
+
+        # ffn
+        x = self.forward_ffn(x)
+        
+        return src_reshaped
 
 
 def _downsample(x):
@@ -287,17 +282,17 @@ class Discriminator(nn.Module):
         self.num_features = embed_dim = self.embed_dim = args.df_dim  # num_features for consistency with other models
         depth = args.d_depth
         self.args = args
-        patch_size = args.patch_size
-        if hybrid_backbone is not None:
-            self.patch_embed = HybridEmbed(
-                hybrid_backbone, img_size=img_size, in_chans=in_chans, embed_dim=embed_dim)
-        else:
-            self.patch_embed = nn.Conv2d(3, embed_dim, kernel_size=patch_size, stride=patch_size, padding=0)
-        num_patches = (args.img_size // patch_size)**2
+#         patch_size = args.patch_size
+#         if hybrid_backbone is not None:
+#             self.patch_embed = HybridEmbed(
+#                 hybrid_backbone, img_size=img_size, in_chans=in_chans, embed_dim=embed_dim)
+#         else:
+#             self.patch_embed = nn.Conv2d(3, embed_dim, kernel_size=patch_size, stride=patch_size, padding=0)
+#         num_patches = (args.img_size // patch_size)**2
 
         self.cls_token = nn.Parameter(torch.zeros(1, 1, embed_dim))
-        self.pos_embed = nn.Parameter(torch.zeros(1, num_patches + 1, embed_dim))
-        self.pos_drop = nn.Dropout(p=drop_rate)
+#         self.pos_embed = nn.Parameter(torch.zeros(1, num_patches + 1, embed_dim))
+#         self.pos_drop = nn.Dropout(p=drop_rate)
         
         dpr = [x.item() for x in torch.linspace(0, drop_path_rate, depth)]  # stochastic depth decay rule
         self.blocks = nn.ModuleList([
@@ -342,12 +337,12 @@ class Discriminator(nn.Module):
         if "None" not in self.args.diff_aug:
             x = DiffAugment(x, self.args.diff_aug, True)
         B = x.shape[0]
-        x = self.patch_embed(x).flatten(2).permute(0,2,1)
+#         x = self.patch_embed(x).flatten(2).permute(0,2,1)
 
-        cls_tokens = self.cls_token.expand(B, -1, -1)  # stole cls_tokens impl from Phil Wang, thanks
-        x = torch.cat((cls_tokens, x), dim=1)
-        x = x + self.pos_embed
-        x = self.pos_drop(x)
+#         cls_tokens = self.cls_token.expand(B, -1, -1)  # stole cls_tokens impl from Phil Wang, thanks
+#         x = torch.cat((cls_tokens, x), dim=1)
+#         x = x + self.pos_embed
+#         x = self.pos_drop(x)
         for blk in self.blocks:
             x = blk(x)
 
